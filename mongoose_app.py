@@ -89,10 +89,10 @@ def load_data():
     subj["polarity_num"] = pd.to_numeric(subj["polarity"], errors="coerce")
     pos["weight"] = pos["role"].map(WEIGHTS).fillna(1)
     pos["backed"] = pos["role"].map(BACKED).fillna(1)
-
-    pb = pos.merge(bills, on="bill_id", how="left", suffixes=("", "_b"))
-    long = pb.merge(subj, on="bill_id", how="left")
-    return legs, bills, subj, pos, long
+    # NOTE: we deliberately do NOT merge these into one big table here — at full
+    # scale (100k+ positions × several subjects each × bill text) that explodes
+    # memory and the app gets OOM-killed. Each view filters first, then joins.
+    return legs, bills, subj, pos
 
 
 
@@ -173,11 +173,9 @@ def lean_chip(exp, res):
 
 # --------------------------------------------------------------------------- #
 try:
-    legs, bills, subj, pos, long = load_data()
+    legs, bills, subj, pos = load_data()
 except Exception as e:
-    st.error("Couldn't load data. Build it first:\n\n```\npython mongoose_build_dataset.py "
-             "--sample\n```\n\n…then `streamlit run mongoose_app.py`.\n\n"
-             f"(detail: {e})")
+    st.error(f"Couldn't load data from the configured sources.\n\n(detail: {e})")
     st.stop()
 
 st.title("🦡 Mongoose")
@@ -199,8 +197,10 @@ if mode == "By legislator":
     bio = opt.loc[opt["label"] == choice, "bioguide"].iloc[0]
     person = legs.loc[legs["bioguide"] == bio].iloc[0]
 
-    mine = long[long["bioguide"] == bio]
     mypos = pos[pos["bioguide"] == bio]
+    # scoped join: only this member's bills → small
+    mine = (mypos.merge(subj, on="bill_id", how="left")
+                 .merge(bills, on="bill_id", how="left", suffixes=("", "_b")))
     c1, c2, c3 = st.columns(3)
     c1.metric("Sponsored", int((mypos["role"] == "sponsor").sum()))
     c2.metric("Cosponsored", int((mypos["role"] == "cosponsor").sum()))
@@ -240,7 +240,12 @@ else:
         st.stop()
     subject = st.selectbox(f"Issue ({len(filtered)} match)", filtered)
 
-    on = long[long["subject"] == subject]
+    # scoped join: only this subject's bills → small
+    issue_subj = subj[subj["subject"] == subject]
+    ids = set(issue_subj["bill_id"])
+    on = (pos[pos["bill_id"].isin(ids)]
+          .merge(issue_subj, on="bill_id", how="left")
+          .merge(bills, on="bill_id", how="left", suffixes=("", "_b")))
     ranked = (on.groupby("bioguide").agg(score=("weight", "sum"), bills=("bill_id", "nunique"))
               .reset_index().merge(legs, on="bioguide", how="left").sort_values("score", ascending=False))
 
@@ -248,8 +253,11 @@ else:
     pcounts = on.merge(legs, on="bioguide")["party"].value_counts()
     st.markdown("<span class='muted'>Activity by party — " +
                 " · ".join(f"{p}: {n}" for p, n in pcounts.items()) + "</span>", unsafe_allow_html=True)
+    if len(ranked) > 40:
+        st.markdown(f"<span class='muted'>Showing the 40 most active of {len(ranked)} "
+                    "legislators on this issue.</span>", unsafe_allow_html=True)
 
-    for _, r in ranked.iterrows():
+    for _, r in ranked.head(40).iterrows():
         member_rows = on[on["bioguide"] == r["bioguide"]].drop_duplicates("bill_id")
         exp, res = lean_readout(member_rows)
         st.markdown("---")
