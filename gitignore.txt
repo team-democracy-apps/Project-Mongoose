@@ -1,0 +1,6 @@
+# never commit real secrets — they live in Streamlit Cloud's Secrets manager
+.streamlit/secrets.toml
+secrets.toml
+# local data (the app reads from Secrets URLs in production)
+data/
+*.db
