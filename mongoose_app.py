@@ -1,11 +1,15 @@
 #!/usr/bin/env python3
 """
-mongoose_app.py — Mongoose legislative accountability dashboard.
+mongoose_app.py — Mongoose: a 119th-Congress accountability dashboard.
 
-Reads four CSV tables (URLs come from Streamlit Secrets; local files in dev),
-makes no API/AI calls at runtime. Flow: pick a state → a representative → see
-what they work on and how they act on it (sponsor / cosponsor / vote), plus an
-optional AI-derived expand/restrict lean when that data is present.
+Model:
+  • PRIORITY  = what a member chooses to put their name on. Scored from
+    sponsorship (5) + cosponsorship (3). Votes are EXCLUDED here — every member
+    votes on everything that reaches the floor, so votes don't distinguish a
+    member's agenda. This is what ranks "top issues."
+  • STANCE    = direction on an issue (expand vs restrict), from the member's
+    actions × each bill's CRS-derived polarity (this is where votes count).
+Reads four CSVs (URLs from Streamlit Secrets); no API/AI calls at runtime.
 """
 
 import re
@@ -23,76 +27,82 @@ except Exception:
         "positions": "data/positions.csv",
     }
 
-WEIGHTS = {"sponsor": 5, "cosponsor": 3, "vote_yea": 1, "vote_nay": 1}
+PRIORITY_PTS = {"sponsor": 5, "cosponsor": 3, "vote_yea": 0, "vote_nay": 0}
 BACKED = {"sponsor": 1, "cosponsor": 1, "vote_yea": 1, "vote_nay": -1}
-ROLE_LABEL = {"sponsor": "Sponsored", "cosponsor": "Cosponsored",
-              "vote_yea": "Voted yes", "vote_nay": "Voted no"}
 PARTY = {"D": ("Democrat", "#2563eb"), "R": ("Republican", "#dc2626"),
          "I": ("Independent", "#7c3aed"), "": ("—", "#64748b")}
-DIRECTIONAL_MIN = 2
+STANCE_MIN = 2
 
-st.set_page_config(page_title="Mongoose — where your reps stand",
-                   page_icon="🦡", layout="wide")
+st.set_page_config(page_title="Mongoose · 119th Congress", page_icon="🦡", layout="wide")
 
-# --- design tokens + CSS ------------------------------------------------------
 st.markdown("""
 <style>
-@import url('https://fonts.googleapis.com/css2?family=Archivo:wght@500;600;700;800&family=Inter:wght@400;500;600&family=IBM+Plex+Mono:wght@500;600&display=swap');
-
+@import url('https://fonts.googleapis.com/css2?family=Archivo:wght@600;700;800;900&family=Inter:wght@400;500;600&family=IBM+Plex+Mono:wght@500;600;700&display=swap');
 :root{
-  --ink:#15202b; --muted:#5b6675; --hair:#e3e7ec; --paper:#ffffff;
-  --bg:#eceef1; --accent:#0d7a6a; --accent-deep:#0a5a4f;
-  --yea:#15803d; --nay:#b91c1c;
+  --ink:#11161d; --muted:#5b6675; --faint:#8a94a3; --hair:#e7eaef; --paper:#fff;
+  --bg:#f4f6f8; --brand:#0e6e62; --brand-d:#0a4f47; --exp:#0e7a4f; --res:#b4322f;
 }
-html, body, [class*="css"]{ font-family:'Inter',sans-serif; }
+html,body,[class*="css"]{ font-family:'Inter',sans-serif; color:var(--ink); }
 .stApp{ background:var(--bg); }
-.block-container{ max-width:1040px; padding-top:1.4rem; }
-h1,h2,h3,h4{ font-family:'Archivo',sans-serif; color:var(--ink); letter-spacing:-.01em; }
+.block-container{ max-width:1080px; padding-top:1.1rem; }
 
-.eyebrow{ font:600 .72rem/1 'Archivo',sans-serif; letter-spacing:.14em;
-  text-transform:uppercase; color:var(--accent); margin-bottom:.35rem; }
+/* masthead */
+.mast{ display:flex; align-items:flex-end; justify-content:space-between;
+  border-bottom:2px solid var(--ink); padding-bottom:10px; margin-bottom:6px; }
+.mast .t{ font:900 2.05rem/1 'Archivo',sans-serif; letter-spacing:-.03em; }
+.mast .t span{ color:var(--brand); }
+.eyebrow{ font:700 .7rem/1 'IBM Plex Mono',monospace; letter-spacing:.18em;
+  text-transform:uppercase; color:var(--muted); }
+.lede{ color:var(--muted); font-size:.92rem; margin:9px 0 4px; }
 
-/* representative scorecard */
-.card{ background:var(--paper); border:1px solid var(--hair); border-radius:14px; }
-.profile{ padding:20px 22px; margin:6px 0 18px;
-  background:linear-gradient(180deg,#0d7a6a 0%, #0a5a4f 100%); color:#fff;
-  border:none; border-radius:14px; }
-.profile .name{ font:800 1.7rem/1.1 'Archivo',sans-serif; letter-spacing:-.02em; }
-.profile .sub{ opacity:.85; font-size:.92rem; margin-top:3px; }
-.stats{ display:flex; gap:26px; margin-top:16px; }
-.stat .n{ font:600 1.55rem/1 'IBM Plex Mono',monospace; }
-.stat .l{ font-size:.72rem; text-transform:uppercase; letter-spacing:.08em; opacity:.8; }
+/* profile */
+.profile{ background:var(--paper); border:1px solid var(--hair); border-left:6px solid var(--pc,#999);
+  border-radius:12px; padding:18px 22px; margin:14px 0 8px;
+  box-shadow:0 1px 2px rgba(16,22,30,.04); }
+.profile .nm{ font:800 1.6rem/1.1 'Archivo',sans-serif; letter-spacing:-.02em; }
+.profile .meta{ color:var(--muted); font-size:.9rem; margin-top:3px; }
+.pchip{ display:inline-block; padding:2px 9px; border-radius:999px; font-size:.7rem;
+  font-weight:700; color:#fff; vertical-align:middle; }
+.tiles{ display:flex; gap:30px; margin-top:15px; }
+.tile .n{ font:700 1.5rem/1 'IBM Plex Mono',monospace; }
+.tile .l{ font-size:.68rem; text-transform:uppercase; letter-spacing:.09em; color:var(--faint); margin-top:2px; }
 
-.pchip{ display:inline-block; padding:2px 9px; border-radius:999px; font-size:.72rem;
-  font-weight:600; color:#fff; vertical-align:middle; }
+/* section */
+.sec{ font:700 .74rem/1 'IBM Plex Mono',monospace; letter-spacing:.16em; text-transform:uppercase;
+  color:var(--muted); margin:22px 0 10px; }
+.note{ color:var(--faint); font-size:.82rem; font-weight:400; text-transform:none; letter-spacing:0; }
 
-/* issue row */
-.issue{ background:var(--paper); border:1px solid var(--hair); border-radius:12px;
-  padding:13px 16px; margin-bottom:10px; }
-.issue-h{ display:flex; justify-content:space-between; align-items:baseline; gap:12px; }
-.issue-name{ font:600 1.02rem/1.2 'Archivo',sans-serif; color:var(--ink); }
-.ledger{ margin-top:8px; display:flex; flex-wrap:wrap; gap:6px; }
-.tag{ font:600 .74rem/1 'IBM Plex Mono',monospace; padding:4px 9px; border-radius:7px;
-  border:1px solid var(--hair); color:var(--ink); background:#f6f8f9; }
-.tag .c{ color:var(--accent); }
-.tag.yea{ color:var(--yea); border-color:#bfe3c9; background:#f0faf3; }
-.tag.nay{ color:var(--nay); border-color:#f0c9c9; background:#fdf2f2; }
+/* scorecard rows */
+.card{ background:var(--paper); border:1px solid var(--hair); border-radius:12px;
+  padding:6px 18px; box-shadow:0 1px 2px rgba(16,22,30,.04); }
+.srow{ display:grid; grid-template-columns:minmax(0,1fr) 220px 110px; gap:16px; align-items:center;
+  padding:11px 0; border-bottom:1px solid var(--hair); }
+.srow:last-child{ border-bottom:none; }
+.iname{ font:600 1rem/1.25 'Archivo',sans-serif; }
+.ibreak{ color:var(--faint); font-size:.78rem; font-family:'IBM Plex Mono',monospace; margin-top:2px; }
+.barwrap{ background:#eef1f4; border-radius:6px; height:12px; overflow:hidden; }
+.bar{ height:100%; background:linear-gradient(90deg,var(--brand),var(--brand-d)); border-radius:6px; }
+.scorecell{ text-align:right; }
+.pts{ font:700 1.05rem/1 'IBM Plex Mono',monospace; }
+.ptl{ font-size:.62rem; color:var(--faint); letter-spacing:.08em; text-transform:uppercase; }
+.stance{ display:inline-block; margin-top:4px; font:700 .68rem/1 'IBM Plex Mono',monospace;
+  padding:3px 8px; border-radius:6px; }
+.stance.exp{ color:var(--exp); background:#e3f6ec; }
+.stance.res{ color:var(--res); background:#fbe7e6; }
+.stance.mix{ color:var(--muted); background:#eef1f4; }
 
-.lean{ font:700 .74rem/1 'IBM Plex Mono',monospace; padding:4px 10px; border-radius:999px; }
-.lean.exp{ color:#0a5a4f; background:#dafbe1; }
-.lean.res{ color:#9a2222; background:#ffe5e5; }
-.lean.mix{ color:var(--muted); background:#eef1f4; }
-
+/* bill */
 .bill{ border-top:1px solid var(--hair); padding:10px 0 4px; }
-.bill-t{ font-weight:600; font-size:.92rem; color:var(--ink); }
-.evid{ color:#41506a; font-size:.86rem; border-left:3px solid var(--accent); padding-left:9px; margin-top:5px; }
+.bill-r{ font:600 .72rem/1 'IBM Plex Mono',monospace; color:var(--muted); }
+.bill-t{ font-weight:600; font-size:.92rem; }
+.evid{ color:#41506a; font-size:.86rem; border-left:3px solid var(--brand); padding-left:9px; margin-top:5px; }
 .muted{ color:var(--muted); font-size:.85rem; }
-a{ color:var(--accent-deep); }
+a{ color:var(--brand-d); }
 </style>
 """, unsafe_allow_html=True)
 
 
-# --- loading (hardened: large-file Drive URLs, HTML detection, validation) ----
+# --- load (hardened: large-file Drive URLs, HTML detection, validation) -------
 def _drive_direct(url):
     if "drive.google.com" in url:
         m = re.search(r"[?&]id=([\w-]+)", url) or re.search(r"/d/([\w-]+)", url)
@@ -125,24 +135,41 @@ def load_data():
     subj["polarity_num"] = pd.to_numeric(subj["polarity"], errors="coerce") if "polarity" in subj else pd.NA
     if "action" not in subj:
         subj["action"] = ""
-    pos["weight"] = pos["role"].map(WEIGHTS).fillna(1)
+    pos["ppts"] = pos["role"].map(PRIORITY_PTS).fillna(0)
     pos["backed"] = pos["role"].map(BACKED).fillna(1)
-    return legs, bills, subj, pos
+    cong = pd.to_numeric(bills["congress"], errors="coerce").dropna() if "congress" in bills else pd.Series([119])
+    congress = int(cong.mode().iloc[0]) if len(cong) else 119
+    return legs, bills, subj, pos, congress
 
 
-# --- small render helpers -----------------------------------------------------
-def party_chip(p):
-    label, color = PARTY.get(str(p), PARTY[""])
-    return f'<span class="pchip" style="background:{color}">{label}</span>'
+# --- helpers ------------------------------------------------------------------
+def congress_label(n):
+    start = 1789 + (n - 1) * 2
+    suf = "th" if 10 <= n % 100 <= 20 else {1: "st", 2: "nd", 3: "rd"}.get(n % 10, "th")
+    return f"{n}{suf} Congress · {start}–{start + 2}"
 
 
-def congress_url(row):
-    seg = {"hr": "house-bill", "s": "senate-bill", "hres": "house-resolution",
-           "sres": "senate-resolution", "hjres": "house-joint-resolution",
-           "sjres": "senate-joint-resolution", "hconres": "house-concurrent-resolution",
-           "sconres": "senate-concurrent-resolution"}.get(str(row.get("type", "")).lower(), "house-bill")
-    cong = str(row.get("congress") or "119").split(".")[0]
-    return f"https://www.congress.gov/bill/{cong}th-congress/{seg}/{row.get('number','')}"
+def stance_chip(rows):
+    """rows carry backed + polarity_num. Returns ('exp'|'res'|'mix'|None, html)."""
+    sig = rows["backed"] * rows["polarity_num"]
+    exp = int((sig > 0).sum())
+    res = int((sig < 0).sum())
+    if exp + res < STANCE_MIN:
+        return None, ""
+    if exp and not res:
+        return "exp", '<span class="stance exp">▲ expand</span>'
+    if res and not exp:
+        return "res", '<span class="stance res">▼ restrict</span>'
+    return "mix", f'<span class="stance mix">mixed {exp}/{res}</span>'
+
+
+def scorerow(label_html, pts, maxpts, breakdown, stance_html):
+    w = int(round(100 * pts / maxpts)) if maxpts else 0
+    return (f'<div class="srow"><div><div class="iname">{label_html}</div>'
+            f'<div class="ibreak">{breakdown}</div></div>'
+            f'<div class="barwrap"><div class="bar" style="width:{w}%"></div></div>'
+            f'<div class="scorecell"><span class="pts">{int(pts)}</span> '
+            f'<span class="ptl">pts</span><br>{stance_html}</div></div>')
 
 
 _STOP = {"and", "the", "for", "of", "to", "in", "on", "or", "a", "an"}
@@ -158,91 +185,68 @@ def evidence(summary, subject):
     return str(summary)[:200]
 
 
-def action_ledger(rows):
-    """rows = a member's position rows for one issue. Returns HTML chips of counts."""
-    c = rows["role"].value_counts()
-    chips = []
-    for role, cls in [("sponsor", ""), ("cosponsor", ""), ("vote_yea", "yea"), ("vote_nay", "nay")]:
-        n = int(c.get(role, 0))
-        if n:
-            chips.append(f'<span class="tag {cls}"><span class="c">{n}</span> {ROLE_LABEL[role].lower()}</span>')
-    return '<div class="ledger">' + "".join(chips) + "</div>" if chips else ""
+def congress_url(row, cong):
+    seg = {"hr": "house-bill", "s": "senate-bill", "hres": "house-resolution",
+           "sres": "senate-resolution", "hjres": "house-joint-resolution",
+           "sjres": "senate-joint-resolution", "hconres": "house-concurrent-resolution",
+           "sconres": "senate-concurrent-resolution"}.get(str(row.get("type", "")).lower(), "house-bill")
+    return f"https://www.congress.gov/bill/{cong}th-congress/{seg}/{row.get('number','')}"
 
 
-def lean_html(rows):
-    exp = res = 0
-    for _, r in rows.iterrows():
-        pol = r.get("polarity_num")
-        if pd.isna(pol) or pol == 0:
-            continue
-        s = r["backed"] * pol
-        exp += s > 0
-        res += s < 0
-    if exp + res < DIRECTIONAL_MIN:
-        return ""
-    if exp and not res:
-        return f'<span class="lean exp">leans toward expanding</span>'
-    if res and not exp:
-        return f'<span class="lean res">leans toward restricting</span>'
-    return f'<span class="lean mix">mixed · {exp} expand / {res} restrict</span>'
-
-
-def bill_card(row, subject):
-    summary = row.get("ai_summary") or row.get("crs_summary") or ""
-    snip = evidence(summary, subject)
-    role = ROLE_LABEL.get(row.get("role"), row.get("role", ""))
-    act = row.get("action") or ""
-    pol = row.get("polarity_num")
-    dir_note = ""
-    if act and pd.notna(pol) and pol != 0:
-        dir_note = f' · {"⬆" if pol > 0 else "⬇"} {act}'
-    st.markdown(
-        f'<div class="bill"><span class="muted">{role}{dir_note}</span><br>'
-        f'<span class="bill-t">{str(row["type"]).upper()} {row["number"]} — {row.get("title","")}</span>'
-        f'{f"<div class=evid>{snip}</div>" if snip else ""}'
-        f'<div style="margin-top:5px"><a href="{congress_url(row)}" target="_blank">View on Congress.gov →</a></div>'
-        f'</div>', unsafe_allow_html=True)
+def bill_html(row, subject, cong):
+    explainer = row.get("ai_explainer") or ""
+    summary = explainer or row.get("ai_summary") or row.get("crs_summary") or ""
+    snip = explainer[:320] if explainer else evidence(summary, subject)
+    rl = {"sponsor": "Sponsor", "cosponsor": "Cosponsor",
+          "vote_yea": "Voted yes", "vote_nay": "Voted no"}.get(row.get("role"), row.get("role", ""))
+    pol, act = row.get("polarity_num"), row.get("action") or ""
+    dirn = f' · {"▲" if pol > 0 else "▼"} {act}' if act and pd.notna(pol) and pol != 0 else ""
+    return (f'<div class="bill"><div class="bill-r">{rl}{dirn}</div>'
+            f'<div class="bill-t">{str(row["type"]).upper()} {row["number"]} — {row.get("title","")}</div>'
+            f'{f"<div class=evid>{snip}</div>" if snip else ""}'
+            f'<div style="margin-top:4px"><a href="{congress_url(row, cong)}" target="_blank">Congress.gov →</a></div></div>')
 
 
 # --- load ---------------------------------------------------------------------
 try:
-    legs, bills, subj, pos = load_data()
+    legs, bills, subj, pos, CONG = load_data()
 except Exception as e:
     st.error(f"Couldn't load the data.\n\n{e}")
     st.stop()
 
-# data-health figures (so it's obvious what's loaded)
 rc = pos["role"].value_counts()
 n_votes = int(rc.get("vote_yea", 0) + rc.get("vote_nay", 0))
 has_leans = bool(subj["polarity_num"].fillna(0).abs().gt(0).any())
+SUBJ_SLIM = subj[["bill_id", "subject", "polarity_num", "action"]]
 
-# --- header + sidebar ---------------------------------------------------------
-st.markdown('<div class="eyebrow">Congressional accountability</div>', unsafe_allow_html=True)
-st.markdown("# Where your representatives stand")
-st.markdown('<span class="muted">Pick your state and representative to see the issues they '
-            'work on and how they act on each — by sponsoring, cosponsoring, and voting.</span>',
-            unsafe_allow_html=True)
+# --- masthead -----------------------------------------------------------------
+st.markdown(
+    f'<div class="mast"><div><div class="eyebrow">{congress_label(CONG)}</div>'
+    f'<div class="t">Mongoose<span>.</span></div></div>'
+    f'<div class="eyebrow">{len(legs):,} members · {len(bills):,} bills</div></div>'
+    '<div class="lede">Where members of Congress put their name — ranked by what they '
+    'sponsor and cosponsor, with their expand/restrict lean from the record. '
+    'Floor votes shape the lean, not the ranking.</div>', unsafe_allow_html=True)
 
 with st.sidebar:
     st.markdown("### Mongoose 🦡")
-    st.markdown(f'<span class="muted">{len(legs):,} legislators · {len(bills):,} bills · '
-                f'{subj["subject"].nunique():,} issues</span>', unsafe_allow_html=True)
+    st.markdown(f'<span class="muted">{congress_label(CONG)}</span>', unsafe_allow_html=True)
     st.markdown("---")
     st.markdown("**Data loaded**")
-    st.markdown(
-        f'<span class="muted">✍ {int(rc.get("sponsor",0)):,} sponsorships<br>'
-        f'➕ {int(rc.get("cosponsor",0)):,} cosponsorships<br>'
-        f'🗳 {n_votes:,} roll-call votes</span>', unsafe_allow_html=True)
+    st.markdown(f'<span class="muted">✍ {int(rc.get("sponsor",0)):,} sponsorships<br>'
+                f'➕ {int(rc.get("cosponsor",0)):,} cosponsorships<br>'
+                f'🗳 {n_votes:,} roll-call votes</span>', unsafe_allow_html=True)
     if n_votes == 0:
-        st.warning("No roll-call votes are loaded. Run the VoteView phase, re-export, "
-                   "and re-publish to add vote-based positions.")
+        st.warning("No roll-call votes loaded — the expand/restrict lean needs them. "
+                   "Run the VoteView phase, then re-export and re-publish.")
     if not has_leans:
-        st.info("Directional leans (expand/restrict) are off. Run the optional AI "
-                "direction phase to turn them on.")
+        st.info("Directional leans are off. Run the optional AI direction phase to "
+                "turn the expand/restrict labels on.")
     st.markdown("---")
-    st.markdown('<span class="muted">Issue tags and summaries from Congress.gov (CRS); '
-                'votes from VoteView. Directional labels are AI-assigned and may err — '
-                'open each bill to verify.</span>', unsafe_allow_html=True)
+    st.markdown('<span class="muted">Scoring: sponsor = 5, cosponsor = 3 (votes excluded '
+                'so universal floor votes don\'t flatten the ranking). Issue tags from '
+                'Congress.gov (CRS); votes from VoteView; leans AI-assigned — verify on each bill.</span>',
+                unsafe_allow_html=True)
 
 mode = st.radio("View", ["By representative", "By issue"], horizontal=True, label_visibility="collapsed")
 
@@ -252,54 +256,62 @@ if mode == "By representative":
     states = sorted([s for s in legs["state"].unique() if s])
     cs, cr = st.columns([1, 2])
     state = cs.selectbox("State", states, index=states.index("CA") if "CA" in states else 0)
-
-    in_state = legs[legs["state"] == state].copy()
-    in_state["label"] = (in_state["name"] + "  ·  " + in_state["party"]
-                         + " · " + in_state["chamber"])
-    in_state = in_state.sort_values(["chamber", "name"])
-    choice = cr.selectbox("Representative", in_state["label"].tolist())
-    person = in_state.loc[in_state["label"] == choice].iloc[0]
+    insta = legs[legs["state"] == state].copy()
+    insta["label"] = insta["name"] + "  ·  " + insta["party"] + " · " + insta["chamber"]
+    insta = insta.sort_values(["chamber", "name"])
+    person = insta.loc[insta["label"] == cr.selectbox("Representative", insta["label"].tolist())].iloc[0]
     bio = person["bioguide"]
 
-    mypos = pos[pos["bioguide"] == bio]
-    mine = mypos.merge(subj, on="bill_id", how="left").merge(
-        bills, on="bill_id", how="left", suffixes=("", "_b"))
+    mp = pos[pos["bioguide"] == bio].merge(SUBJ_SLIM, on="bill_id", how="left")
+    mp = mp[mp["subject"].astype(str) != ""]
+    pname, pcol = PARTY.get(person["party"], PARTY[""])
 
-    pname, _ = PARTY.get(person["party"], PARTY[""])
     st.markdown(
-        f'<div class="profile"><div class="name">{person["name"]}</div>'
-        f'<div class="sub">{pname} · {person["state"]} · {person["chamber"]}</div>'
-        f'<div class="stats">'
-        f'<div class="stat"><div class="n">{int((mypos.role=="sponsor").sum()):,}</div><div class="l">Sponsored</div></div>'
-        f'<div class="stat"><div class="n">{int((mypos.role=="cosponsor").sum()):,}</div><div class="l">Cosponsored</div></div>'
-        f'<div class="stat"><div class="n">{int(mypos.role.isin(["vote_yea","vote_nay"]).sum()):,}</div><div class="l">Votes</div></div>'
+        f'<div class="profile" style="--pc:{pcol}"><div class="nm">{person["name"]} '
+        f'<span class="pchip" style="background:{pcol}">{pname}</span></div>'
+        f'<div class="meta">{person["state"]} · {person["chamber"]} · {congress_label(CONG)}</div>'
+        f'<div class="tiles">'
+        f'<div class="tile"><div class="n">{int((pos[pos.bioguide==bio].role=="sponsor").sum()):,}</div><div class="l">Sponsored</div></div>'
+        f'<div class="tile"><div class="n">{int((pos[pos.bioguide==bio].role=="cosponsor").sum()):,}</div><div class="l">Cosponsored</div></div>'
+        f'<div class="tile"><div class="n">{int(pos[pos.bioguide==bio].role.isin(["vote_yea","vote_nay"]).sum()):,}</div><div class="l">Votes cast</div></div>'
         f'</div></div>', unsafe_allow_html=True)
 
-    rank = (mine[mine["subject"].astype(str) != ""]
-            .groupby("subject").agg(score=("weight", "sum"), bills=("bill_id", "nunique"))
-            .sort_values("score", ascending=False).reset_index())
+    eng = (mp.groupby("subject")
+           .agg(points=("ppts", "sum"),
+                sponsored=("role", lambda s: int((s == "sponsor").sum())),
+                cosponsored=("role", lambda s: int((s == "cosponsor").sum())),
+                bills=("bill_id", "nunique"))
+           .reset_index())
+    eng = eng[eng["points"] > 0].sort_values("points", ascending=False)
 
-    if rank.empty:
-        st.info("No issue activity found for this representative yet.")
+    if eng.empty:
+        st.info("No sponsored or cosponsored bills with issue tags for this member yet.")
     else:
-        st.markdown(f'<div class="eyebrow">Top issues · {person["name"]}</div>', unsafe_allow_html=True)
-        for _, irow in rank.head(18).iterrows():
-            sub = irow["subject"]
-            rows = mine[mine["subject"] == sub]
-            ledger = action_ledger(rows)
-            lean = lean_html(rows.drop_duplicates("bill_id"))
-            st.markdown(
-                f'<div class="issue"><div class="issue-h">'
-                f'<span class="issue-name">{sub}</span>{lean}</div>{ledger}</div>',
-                unsafe_allow_html=True)
-            with st.expander(f"{int(irow['bills'])} bills on “{sub}”"):
-                for _, b in rows.drop_duplicates("bill_id").sort_values("weight", ascending=False).iterrows():
-                    bill_card(b, sub)
+        st.markdown(f'<div class="sec">Issue priorities '
+                    f'<span class="note">— ranked by sponsorship (5) + cosponsorship (3)</span></div>',
+                    unsafe_allow_html=True)
+        mx = eng["points"].max()
+        rows_html = []
+        for _, e in eng.head(15).iterrows():
+            sub = e["subject"]
+            _, sh = stance_chip(mp[mp["subject"] == sub].drop_duplicates("bill_id"))
+            bd = " · ".join(filter(None, [
+                f'{e.sponsored} sponsored' if e.sponsored else "",
+                f'{e.cosponsored} cosponsored' if e.cosponsored else ""]))
+            rows_html.append(scorerow(sub, e["points"], mx, bd, sh))
+        st.markdown('<div class="card">' + "".join(rows_html) + "</div>", unsafe_allow_html=True)
+
+        st.markdown('<div class="sec">Look inside an issue</div>', unsafe_allow_html=True)
+        pick = st.selectbox("Issue", eng["subject"].tolist(), label_visibility="collapsed")
+        det = mp[mp["subject"] == pick].drop_duplicates("bill_id").merge(bills, on="bill_id", how="left", suffixes=("", "_b"))
+        st.markdown('<div class="card" style="padding:4px 18px 12px">'
+                    + "".join(bill_html(b, pick, CONG) for _, b in det.sort_values("ppts", ascending=False).iterrows())
+                    + "</div>", unsafe_allow_html=True)
 
 
 # ================================ BY ISSUE ================================== #
 else:
-    q = st.text_input("Search issues", placeholder="prescription drugs, border, firearms, Medicaid…")
+    q = st.text_input("Search issues", placeholder="prescription drugs, border security, firearms…")
     all_subj = sorted(subj["subject"].dropna().unique().tolist())
     matches = [s for s in all_subj if q.lower() in s.lower()] if q else all_subj
     if not matches:
@@ -307,30 +319,32 @@ else:
         st.stop()
     subject = st.selectbox(f"Issue · {len(matches):,} match", matches)
 
-    issue_subj = subj[subj["subject"] == subject]
-    ids = set(issue_subj["bill_id"])
-    on = (pos[pos["bill_id"].isin(ids)]
-          .merge(issue_subj, on="bill_id", how="left")
-          .merge(bills, on="bill_id", how="left", suffixes=("", "_b")))
-    ranked = (on.groupby("bioguide").agg(score=("weight", "sum"))
-              .reset_index().merge(legs, on="bioguide", how="left")
-              .sort_values("score", ascending=False))
+    isub = SUBJ_SLIM[SUBJ_SLIM["subject"] == subject]
+    on = pos[pos["bill_id"].isin(set(isub["bill_id"]))].merge(isub, on="bill_id", how="left")
+    eng = (on.groupby("bioguide")
+           .agg(points=("ppts", "sum"),
+                sponsored=("role", lambda s: int((s == "sponsor").sum())),
+                cosponsored=("role", lambda s: int((s == "cosponsor").sum())))
+           .reset_index().merge(legs, on="bioguide", how="left"))
+    eng = eng[eng["points"] > 0].sort_values("points", ascending=False)
 
-    pc = on.merge(legs, on="bioguide")["party"].value_counts()
-    st.markdown(f'<div class="eyebrow">Activity on this issue</div>'
-                f'<span class="muted">' + " · ".join(f"{PARTY.get(p,('?',''))[0]}: {n}" for p, n in pc.items())
-                + (f' · showing top 40 of {len(ranked)} legislators' if len(ranked) > 40 else "")
-                + "</span>", unsafe_allow_html=True)
-
-    for _, r in ranked.head(40).iterrows():
-        rows = on[on["bioguide"] == r["bioguide"]]
-        ledger = action_ledger(rows)
-        lean = lean_html(rows.drop_duplicates("bill_id"))
-        st.markdown(
-            f'<div class="issue"><div class="issue-h"><span class="issue-name">'
-            f'{r["name"]} {party_chip(r["party"])} '
-            f'<span class="muted">{r["state"]} · {r["chamber"]}</span></span>{lean}</div>{ledger}</div>',
-            unsafe_allow_html=True)
-        with st.expander(f"{rows['bill_id'].nunique()} bills"):
-            for _, b in rows.drop_duplicates("bill_id").sort_values("weight", ascending=False).iterrows():
-                bill_card(b, subject)
+    st.markdown(f'<div class="sec">Who drives “{subject}” '
+                f'<span class="note">— authors & cosponsors, ranked. Floor votes excluded.</span></div>',
+                unsafe_allow_html=True)
+    if eng.empty:
+        st.info("No members have sponsored or cosponsored bills tagged with this issue.")
+        st.stop()
+    mx = eng["points"].max()
+    rows_html = []
+    for _, e in eng.head(40).iterrows():
+        _, sh = stance_chip(on[on["bioguide"] == e["bioguide"]].drop_duplicates("bill_id"))
+        _, pcol = PARTY.get(e["party"], PARTY[""])
+        label = (f'{e["name"]} <span class="pchip" style="background:{pcol}">{e["party"]}</span> '
+                 f'<span class="muted">{e["state"]} · {e["chamber"]}</span>')
+        bd = " · ".join(filter(None, [f'{e.sponsored} sponsored' if e.sponsored else "",
+                                      f'{e.cosponsored} cosponsored' if e.cosponsored else ""]))
+        rows_html.append(scorerow(label, e["points"], mx, bd, sh))
+    st.markdown('<div class="card">' + "".join(rows_html) + "</div>", unsafe_allow_html=True)
+    if len(eng) > 40:
+        st.markdown(f'<div class="muted" style="margin-top:8px">Showing top 40 of {len(eng):,} members.</div>',
+                    unsafe_allow_html=True)
