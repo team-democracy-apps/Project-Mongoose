@@ -24,11 +24,11 @@ except Exception:
         "positions": "data/positions.csv",
     }
 
-PRIORITY_PTS = {"sponsor": 5, "cosponsor": 3, "vote_yea": 0, "vote_nay": 0}
+PRIORITY_PTS = {"sponsor": 2, "cosponsor": 1, "vote_yea": 0, "vote_nay": 0}
 BACKED = {"sponsor": 1, "cosponsor": 1, "vote_yea": 1, "vote_nay": -1}
 PARTY = {"D": ("Democrat", "#2563eb"), "R": ("Republican", "#dc2626"),
          "I": ("Independent", "#7c3aed"), "": ("—", "#64748b")}
-STANCE_MIN = 2
+STANCE_MIN = 1
 
 st.set_page_config(page_title="Mongoose · 119th Congress", page_icon="🦡", layout="wide")
 
@@ -217,7 +217,7 @@ with st.sidebar:
     if not has_leans:
         st.info("Directional leans are off until the AI direction phase runs.")
     st.markdown("---")
-    st.markdown('<span class="muted">Ranking = sponsorship (5) + cosponsorship (3), weighted toward '
+    st.markdown('<span class="muted">Ranking = sponsorship (2) + cosponsorship (1), weighted toward '
                 'issues few members touch. Votes feed the lean, not the ranking. Tags from Congress.gov '
                 "(CRS); votes from VoteView; leans AI-assigned — verify on each bill.</span>",
                 unsafe_allow_html=True)
